@@ -58,7 +58,7 @@ class StorageService {
             Bucket: this.bucket,
             Key: key,
         });
-        const url = await getSignedUrl(this.s3, command, {expiresIn});
+        const url = await getSignedUrl(this.s3Public, command, {expiresIn});
         return url;
     }
 
