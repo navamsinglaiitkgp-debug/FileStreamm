@@ -1,0 +1,189 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: fs-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # ---------- MinIO ----------
+  minio:
+    image: minio/minio:latest
+    container_name: fs-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: filestreammadmin
+      MINIO_ROOT_PASSWORD: filestreammadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://localhost:9000/minio/health/live >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 filestreammadmin filestreammadmin123; do
+        echo 'Waiting for MinIO...';
+        sleep 2;
+      done;
+      mc mb -p local/filestreamm || true;
+      exit 0;
+      "
+
+
+
+  # ---------- Kafka ----------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: fs-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: fs-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # internal (docker) + external (host)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # ---------- Backend (API) ----------
+  backend:
+    build: ./backend
+    container_name: fs-backend
+    depends_on:
+      - mongo
+      - kafka
+      - minio-init
+    ports:
+      - "5001:5001"
+    environment:
+      - NODE_ENV=development
+      - PORT=5001
+      - MONGO_URI=mongodb://mongo:27017/filestreamm
+      # S3/MinIO (must be service name)
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=filestreammadmin
+      - S3_SECRET_KEY=filestreammadmin123
+      - S3_BUCKET=filestreamm
+      - S3_REGION=us-east-1
+      - S3_FORCE_PATH_STYLE=true
+  # JWT
+      - JWT_SECRET=supersecret_dev_key_change_me
+      - JWT_EXPIRES_IN=7d
+  # Presign expiries
+      - DOWNLOAD_URL_EXPIRES_SECONDS=60
+      - UPLOAD_URL_EXPIRES_SECONDS=300
+  # Kafka (must be service name)
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_CLIENT_ID=filestreamm-api
+      - KAFKA_TOPIC_FILE_EVENTS=file-events
+      - S3_PUBLIC_ENDPOINT=http://localhost:9000
+
+  # ---------- Analytics ----------
+  analytics-service:
+    build: ./services/analytics-service
+    container_name: fs-analytics
+    depends_on:
+      - mongo
+      - kafka
+    ports:
+      - "7001:7001"
+    environment:
+      - NODE_ENV=development
+      - PORT=7001
+      - JWT_SECRET=supersecret_dev_key_change_me
+      - MONGO_URI=mongodb://mongo:27017/filestreamm
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC_FILE_EVENTS=file-events
+      - KAFKA_TOPIC_ANALYTICS_UPDATES=analytics-updates
+      - JWT_ISSUER=filestreamm-api
+      - JWT_AUDIENCE=filestreamm-users
+
+  # ---------- Notification ----------
+  notification-service:
+    build: ./services/notification-service
+    container_name: fs-notification
+    depends_on:
+      - mongo
+      - kafka
+    ports:
+      - "7002:7002"
+    environment:
+      - NODE_ENV=development
+      - PORT=7002
+      - JWT_SECRET=supersecret_dev_key_change_me
+      - MONGO_URI=mongodb://mongo:27017/filestreamm
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC_FILE_EVENTS=file-events
+      - JWT_SECRET=supersecret_dev_key_change_me
+      - JWT_ISSUER=filestreamm-api
+      - JWT_AUDIENCE=filestreamm-users
+      - EMAIL_ENABLED=true
+      - FROM_EMAIL=no-reply@filestreamm.local
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USER=navamsingla3001@gmail.com
+      - SMTP_PASS=bisobxablwyetmkj
+      - TEST_TO_EMAIL=navamsingla.iitkgp@gmail.com
+
+
+  # ---------- Realtime Gateway ----------
+  realtime-gateway:
+    build: ./services/realtime-gateway
+    container_name: fs-gateway
+    depends_on:
+      - kafka
+    ports:
+      - "7003:7003"
+    environment:
+      - NODE_ENV=development
+      - PORT=7003
+      - JWT_SECRET=supersecret_dev_key_change_me
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC_FILE_EVENTS=file-events
+      - KAFKA_TOPIC_ANALYTICS_UPDATES=analytics-updates
+      - CORS_ORIGINS=*
+  
+  dashboard:
+    build:
+      context: ./dashboard
+      args:
+        VITE_API_BASE: http://localhost:5001
+        VITE_NOTIF_BASE: http://localhost:7002
+        VITE_GATEWAY_WS: http://localhost:7003
+    container_name: fs-dashboard
+    depends_on:
+      - backend
+      - notification-service
+      - realtime-gateway
+    ports:
+      - "5173:80"
+
+
+volumes:
+  mongo_data:
+  minio_data:
